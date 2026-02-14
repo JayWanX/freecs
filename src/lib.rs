@@ -1276,8 +1276,12 @@ macro_rules! ecs_impl {
                     }
 
                     $(
-                        if table.mask & $mask != 0 {
-                            table.$name.swap_remove(array_idx);
+                        $(#[$comp_attr])*
+                        $crate::paste::paste! {
+                            if table.mask & $mask != 0 {
+                                table.$name.swap_remove(array_idx);
+                                table.[<$name _changed>].swap_remove(array_idx);
+                            }
                         }
                     )*
                     table.entity_indices.swap_remove(array_idx);
@@ -1351,15 +1355,19 @@ macro_rules! ecs_impl {
             }
 
             pub fn get_all_entities(&self) -> Vec<$crate::Entity> {
-                let mut result = Vec::new();
+                let mut result = Vec::with_capacity(self.entity_count());
                 for table in &self.tables {
                     result.extend(table.entity_indices.iter().copied());
                 }
                 result
             }
 
+            pub fn entity_count(&self) -> usize {
+                self.tables.iter().map(|table| table.entity_indices.len()).sum()
+            }
+
             pub fn entity_has_components(&self, entity: $crate::Entity, components: u64) -> bool {
-                self.component_mask(entity).unwrap_or(0) & components != 0
+                self.component_mask(entity).unwrap_or(0) & components == components
             }
 
             pub fn increment_tick(&mut self) {
@@ -1659,12 +1667,13 @@ macro_rules! ecs_impl {
                 let tag_exclude = exclude & ALL_TAGS_MASK;
 
                 let table_indices: Vec<usize> = self.get_cached_tables(component_include).to_vec();
+                let table_index_set: std::collections::HashSet<usize> = table_indices.iter().copied().collect();
 
                 if tag_include == 0 && tag_exclude == 0 {
                     self.tables
                         .par_iter_mut()
                         .enumerate()
-                        .filter(|(idx, table)| table_indices.contains(idx) && table.mask & component_exclude == 0)
+                        .filter(|(idx, table)| table_index_set.contains(idx) && table.mask & component_exclude == 0)
                         .for_each(|(_, table)| {
                             for idx in 0..table.entity_indices.len() {
                                 let entity = table.entity_indices[idx];
@@ -1683,7 +1692,7 @@ macro_rules! ecs_impl {
                     self.tables
                         .par_iter_mut()
                         .enumerate()
-                        .filter(|(idx, table)| table_indices.contains(idx) && table.mask & component_exclude == 0)
+                        .filter(|(idx, table)| table_index_set.contains(idx) && table.mask & component_exclude == 0)
                         .for_each(|(_, table)| {
                             for idx in 0..table.entity_indices.len() {
                                 let entity = table.entity_indices[idx];
@@ -1721,7 +1730,7 @@ macro_rules! ecs_impl {
                             let mut changed = false;
                             $(
                                 $crate::paste::paste! {
-                                    if table.mask & $mask != 0 && table.[<$name _changed>][idx] > since_tick {
+                                    if component_include & $mask != 0 && table.mask & $mask != 0 && table.[<$name _changed>][idx] > since_tick {
                                         changed = true;
                                     }
                                 }
@@ -1756,7 +1765,7 @@ macro_rules! ecs_impl {
                             let mut changed = false;
                             $(
                                 $crate::paste::paste! {
-                                    if table.mask & $mask != 0 && table.[<$name _changed>][idx] > since_tick {
+                                    if component_include & $mask != 0 && table.mask & $mask != 0 && table.[<$name _changed>][idx] > since_tick {
                                         changed = true;
                                     }
                                 }
@@ -1923,6 +1932,22 @@ macro_rules! ecs_impl {
                     return Some(entity);
                 }
             }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                let mut remaining = 0;
+                for table_idx in self.table_index..self.tables.len() {
+                    let table = &self.tables[table_idx];
+                    if table.mask & self.mask != self.mask {
+                        continue;
+                    }
+                    if table_idx == self.table_index {
+                        remaining += table.entity_indices.len().saturating_sub(self.array_index);
+                    } else {
+                        remaining += table.entity_indices.len();
+                    }
+                }
+                (remaining, Some(remaining))
+            }
         }
 
         $(
@@ -1961,6 +1986,22 @@ macro_rules! ecs_impl {
                             self.array_index += 1;
                             return Some(component);
                         }
+                    }
+
+                    fn size_hint(&self) -> (usize, Option<usize>) {
+                        let mut remaining = 0;
+                        for table_idx in self.table_index..self.tables.len() {
+                            let table = &self.tables[table_idx];
+                            if table.mask & $mask == 0 {
+                                continue;
+                            }
+                            if table_idx == self.table_index {
+                                remaining += table.$name.len().saturating_sub(self.array_index);
+                            } else {
+                                remaining += table.$name.len();
+                            }
+                        }
+                        (remaining, Some(remaining))
                     }
                 }
 
@@ -4141,6 +4182,288 @@ mod tests {
 
         let final_cache_size = world.query_cache.len();
         assert_eq!(final_cache_size, 3);
+    }
+
+    #[test]
+    fn test_entity_has_components_requires_all() {
+        let mut world = World::default();
+        let entity = world.spawn_entities(POSITION, 1)[0];
+
+        assert!(
+            !world.entity_has_components(entity, POSITION | VELOCITY),
+            "Should return false when entity only has POSITION but query asks for POSITION | VELOCITY"
+        );
+
+        assert!(
+            world.entity_has_components(entity, POSITION),
+            "Should return true when entity has the single queried component"
+        );
+
+        world.add_components(entity, VELOCITY);
+        assert!(
+            world.entity_has_components(entity, POSITION | VELOCITY),
+            "Should return true when entity has all queried components"
+        );
+
+        assert!(
+            !world.entity_has_components(entity, POSITION | VELOCITY | HEALTH),
+            "Should return false when entity is missing one of three queried components"
+        );
+    }
+
+    #[test]
+    fn test_entity_has_generated_methods_consistency() {
+        let mut world = World::default();
+        let entity = world.spawn_entities(POSITION | VELOCITY, 1)[0];
+
+        assert!(world.entity_has_position(entity));
+        assert!(world.entity_has_velocity(entity));
+        assert!(!world.entity_has_health(entity));
+
+        assert!(world.entity_has_components(entity, POSITION));
+        assert!(world.entity_has_components(entity, VELOCITY));
+        assert!(world.entity_has_components(entity, POSITION | VELOCITY));
+        assert!(!world.entity_has_components(entity, HEALTH));
+        assert!(!world.entity_has_components(entity, POSITION | HEALTH));
+    }
+
+    #[test]
+    fn test_despawn_preserves_change_vec_consistency() {
+        let mut world = World::default();
+        let entities = world.spawn_entities(POSITION, 5);
+
+        world.step();
+
+        world.get_position_mut(entities[0]).unwrap().x = 10.0;
+        world.get_position_mut(entities[4]).unwrap().x = 40.0;
+
+        world.despawn_entities(&[entities[2]]);
+
+        for table in &world.tables {
+            if table.mask & POSITION != 0 {
+                let entity_count = table.entity_indices.len();
+                assert_eq!(
+                    table.position.len(),
+                    entity_count,
+                    "Position vec length should match entity count after despawn"
+                );
+                assert_eq!(
+                    table.position_changed.len(),
+                    entity_count,
+                    "Position changed vec length should match entity count after despawn"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_change_detection_after_despawn() {
+        let mut world = World::default();
+        let e1 = world.spawn_entities(POSITION, 1)[0];
+        let e2 = world.spawn_entities(POSITION, 1)[0];
+        let e3 = world.spawn_entities(POSITION, 1)[0];
+
+        world.set_position(e1, Position { x: 1.0, y: 0.0 });
+        world.set_position(e2, Position { x: 2.0, y: 0.0 });
+        world.set_position(e3, Position { x: 3.0, y: 0.0 });
+
+        world.step();
+
+        world.get_position_mut(e3).unwrap().x = 30.0;
+
+        world.despawn_entities(&[e2]);
+
+        let mut changed_entities = Vec::new();
+        world.for_each_mut_changed(POSITION, 0, |entity, _table, _idx| {
+            changed_entities.push(entity);
+        });
+
+        assert!(
+            changed_entities.contains(&e3),
+            "e3 was modified and should be detected as changed"
+        );
+        assert!(
+            !changed_entities.contains(&e1),
+            "e1 was not modified and should not be detected as changed"
+        );
+    }
+
+    #[test]
+    fn test_change_detection_only_checks_queried_components() {
+        let mut world = World::default();
+        let entity = world.spawn_entities(POSITION | VELOCITY, 1)[0];
+
+        world.step();
+
+        world.get_velocity_mut(entity).unwrap().x = 99.0;
+
+        let mut pos_changed_count = 0;
+        world.for_each_mut_changed(POSITION, 0, |_entity, _table, _idx| {
+            pos_changed_count += 1;
+        });
+        assert_eq!(
+            pos_changed_count, 0,
+            "Changing velocity should not trigger position change detection"
+        );
+
+        let mut vel_changed_count = 0;
+        world.for_each_mut_changed(VELOCITY, 0, |_entity, _table, _idx| {
+            vel_changed_count += 1;
+        });
+        assert_eq!(
+            vel_changed_count, 1,
+            "Changing velocity should trigger velocity change detection"
+        );
+    }
+
+    #[test]
+    fn test_change_detection_multi_component_query_only_relevant() {
+        let mut world = World::default();
+        let e1 = world.spawn_entities(POSITION | VELOCITY | HEALTH, 1)[0];
+        let e2 = world.spawn_entities(POSITION | VELOCITY | HEALTH, 1)[0];
+
+        world.step();
+
+        world.get_position_mut(e1).unwrap().x = 5.0;
+        world.get_health_mut(e2).unwrap().value = 50.0;
+
+        let mut changed_entities = Vec::new();
+        world.for_each_mut_changed(POSITION | VELOCITY, 0, |entity, _table, _idx| {
+            changed_entities.push(entity);
+        });
+
+        assert!(
+            changed_entities.contains(&e1),
+            "e1 had position changed, which is in the query"
+        );
+        assert!(
+            !changed_entities.contains(&e2),
+            "e2 only had health changed, which is NOT in the query"
+        );
+    }
+
+    #[test]
+    fn test_entity_count() {
+        let mut world = World::default();
+        assert_eq!(world.entity_count(), 0);
+
+        world.spawn_entities(POSITION, 5);
+        assert_eq!(world.entity_count(), 5);
+
+        world.spawn_entities(VELOCITY, 3);
+        assert_eq!(world.entity_count(), 8);
+
+        let entities = world.spawn_entities(POSITION | VELOCITY, 2);
+        assert_eq!(world.entity_count(), 10);
+
+        world.despawn_entities(&[entities[0]]);
+        assert_eq!(world.entity_count(), 9);
+    }
+
+    #[test]
+    fn test_entity_count_matches_get_all_entities() {
+        let mut world = World::default();
+
+        world.spawn_entities(POSITION, 10);
+        world.spawn_entities(VELOCITY, 5);
+        world.spawn_entities(POSITION | VELOCITY | HEALTH, 3);
+
+        assert_eq!(world.entity_count(), world.get_all_entities().len());
+    }
+
+    #[test]
+    fn test_entity_query_iter_size_hint() {
+        let mut world = World::default();
+
+        world.spawn_entities(POSITION | VELOCITY, 5);
+        world.spawn_entities(POSITION, 3);
+        world.spawn_entities(VELOCITY | HEALTH, 2);
+
+        let iter = world.query_entities(POSITION);
+        let (lower, upper) = iter.size_hint();
+        assert_eq!(lower, 8);
+        assert_eq!(upper, Some(8));
+
+        let count = world.query_entities(POSITION).count();
+        assert_eq!(count, 8);
+
+        let iter = world.query_entities(POSITION | VELOCITY);
+        let (lower, upper) = iter.size_hint();
+        assert_eq!(lower, 5);
+        assert_eq!(upper, Some(5));
+    }
+
+    #[test]
+    fn test_entity_query_iter_size_hint_decreases() {
+        let mut world = World::default();
+        world.spawn_entities(POSITION, 3);
+
+        let mut iter = world.query_entities(POSITION);
+        assert_eq!(iter.size_hint(), (3, Some(3)));
+
+        iter.next();
+        assert_eq!(iter.size_hint(), (2, Some(2)));
+
+        iter.next();
+        assert_eq!(iter.size_hint(), (1, Some(1)));
+
+        iter.next();
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+
+    #[test]
+    fn test_component_query_iter_size_hint() {
+        let mut world = World::default();
+        world.spawn_entities(POSITION, 4);
+        world.spawn_entities(POSITION | VELOCITY, 3);
+
+        let iter = world.query_position();
+        let (lower, upper) = iter.size_hint();
+        assert_eq!(lower, 7);
+        assert_eq!(upper, Some(7));
+
+        let count = world.query_position().count();
+        assert_eq!(count, 7);
+    }
+
+    #[test]
+    fn test_query_entities_collect_preallocates() {
+        let mut world = World::default();
+        world.spawn_entities(POSITION | VELOCITY, 100);
+
+        let entities: Vec<Entity> = world.query_entities(POSITION | VELOCITY).collect();
+        assert_eq!(entities.len(), 100);
+    }
+
+    #[test]
+    fn test_despawn_multiple_same_table_change_vecs() {
+        let mut world = World::default();
+        let entities = world.spawn_entities(POSITION | VELOCITY, 6);
+
+        world.step();
+
+        world.get_position_mut(entities[0]).unwrap().x = 10.0;
+        world.get_position_mut(entities[5]).unwrap().x = 50.0;
+
+        world.despawn_entities(&[entities[1], entities[3]]);
+
+        for table in &world.tables {
+            if table.mask & POSITION != 0 {
+                let entity_count = table.entity_indices.len();
+                assert_eq!(table.position.len(), entity_count);
+                assert_eq!(table.position_changed.len(), entity_count);
+            }
+            if table.mask & VELOCITY != 0 {
+                let entity_count = table.entity_indices.len();
+                assert_eq!(table.velocity.len(), entity_count);
+                assert_eq!(table.velocity_changed.len(), entity_count);
+            }
+        }
+
+        let remaining = world.get_all_entities();
+        assert_eq!(remaining.len(), 4);
+        assert!(world.get_position(entities[0]).is_some());
+        assert!(world.get_position(entities[5]).is_some());
     }
 
     mod cfg_test {
