@@ -796,14 +796,14 @@ macro_rules! ecs_impl {
             $(
                 $(#[$comp_attr])*
                 $crate::paste::paste! {
-                    pub fn [<with_$name>](&mut self, value: $type) -> &mut Self {
+                    pub fn [<with_$name>](mut self, value: $type) -> Self {
                         self.$name = Some(value);
                         self
                     }
                 }
             )*
 
-            pub fn spawn(&self, world: &mut $world, instances: usize) -> Vec<$crate::Entity> {
+            pub fn spawn(self, world: &mut $world, instances: usize) -> Vec<$crate::Entity> {
                 let mut mask = 0;
                 $(
                     $(#[$comp_attr])*
@@ -812,15 +812,28 @@ macro_rules! ecs_impl {
                     }
                 )*
                 let entities = world.spawn_entities(mask, instances);
-                for entity in entities.iter() {
-                    $(
-                        $(#[$comp_attr])*
-                        $crate::paste::paste! {
-                            if let Some(component) = self.$name.clone() {
-                                world.[<set_$name>](*entity, component);
+                let last_entity_index = entities.len().saturating_sub(1);
+                for (entity_index, entity) in entities.iter().enumerate() {
+                    if entity_index == last_entity_index {
+                        $(
+                            $(#[$comp_attr])*
+                            $crate::paste::paste! {
+                                if let Some(component) = self.$name {
+                                    world.[<set_$name>](*entity, component);
+                                }
                             }
-                        }
-                    )*
+                        )*
+                        break;
+                    } else {
+                        $(
+                            $(#[$comp_attr])*
+                            $crate::paste::paste! {
+                                if let Some(ref component) = self.$name {
+                                    world.[<set_$name>](*entity, component.clone());
+                                }
+                            }
+                        )*
+                    }
                 }
                 entities
             }
@@ -1594,7 +1607,15 @@ macro_rules! ecs_impl {
                 let tag_exclude = exclude & ALL_TAGS_MASK;
 
                 for table in &self.tables {
-                    if table.mask & component_include == component_include && table.mask & component_exclude == 0 {
+                    if table.mask & component_include != component_include || table.mask & component_exclude != 0 {
+                        continue;
+                    }
+
+                    if tag_include == 0 && tag_exclude == 0 {
+                        for (idx, &entity) in table.entity_indices.iter().enumerate() {
+                            f(entity, table, idx);
+                        }
+                    } else {
                         for (idx, &entity) in table.entity_indices.iter().enumerate() {
                             if self.entity_matches_tags(entity, tag_include, tag_exclude) {
                                 f(entity, table, idx);
@@ -4498,6 +4519,51 @@ mod tests {
             world.set_base(entities[0], BaseComponent { value: 10 });
             assert_eq!(world.get_base(entities[0]).unwrap().value, 10);
 
+            world.resources.counter = 42;
+            assert_eq!(world.resources.counter, 42);
+
+            let mut count = 0;
+            world.query().with(BASE).iter(|_entity, _table, _idx| {
+                count += 1;
+            });
+            assert_eq!(count, 3);
+
+            world.query_mut().with(BASE).iter(|_entity, table, idx| {
+                table.base[idx].value += 1;
+            });
+            assert_eq!(world.get_base(entities[0]).unwrap().value, 11);
+
+            let mut without_count = 0;
+            world
+                .query()
+                .with(BASE)
+                .without(0)
+                .iter(|_entity, _table, _idx| {
+                    without_count += 1;
+                });
+            assert_eq!(without_count, 3);
+
+            let mut without_mut_count = 0;
+            world
+                .query_mut()
+                .with(BASE)
+                .without(0)
+                .iter(|_entity, _table, _idx| {
+                    without_mut_count += 1;
+                });
+            assert_eq!(without_mut_count, 3);
+
+            let mut iter_count = 0;
+            world.iter_base(|_entity, _base| {
+                iter_count += 1;
+            });
+            assert_eq!(iter_count, 3);
+
+            world.iter_base_mut(|_entity, base| {
+                base.value *= 2;
+            });
+            assert_eq!(world.get_base(entities[0]).unwrap().value, 22);
+
             #[cfg(debug_assertions)]
             {
                 world.set_debug_only(entities[0], DebugComponent { debug_value: 42 });
@@ -4505,6 +4571,17 @@ mod tests {
 
                 let debug_entities = world.spawn_entities(DEBUG_ONLY, 2);
                 assert_eq!(debug_entities.len(), 2);
+
+                let mut debug_count = 0;
+                world.iter_debug_only(|_entity, _debug| {
+                    debug_count += 1;
+                });
+                assert_eq!(debug_count, 3);
+
+                world.iter_debug_only_mut(|_entity, debug| {
+                    debug.debug_value += 1;
+                });
+                assert_eq!(world.get_debug_only(entities[0]).unwrap().debug_value, 43);
             }
         }
     }
